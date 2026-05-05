@@ -1,0 +1,9 @@
+# Environments
+venv/
+.venv/
+env/
+__pycache__/
+*.pyc
+.env
+*.mp4
+temp/

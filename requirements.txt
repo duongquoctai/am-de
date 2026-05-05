@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+supabase
+cloudinary
+httpx
+instagrapi
+pydantic
+pydantic-settings
