@@ -1,8 +1,9 @@
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Literal
 
 class JobCreateRequest(BaseModel):
-    keyword: str
+    target: str
+    crawl_type: Literal["hashtag", "profile"]
     target_count: int = 5
     platform: str = "instagram"
 

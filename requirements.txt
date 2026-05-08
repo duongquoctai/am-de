@@ -3,6 +3,6 @@ uvicorn[standard]
 supabase
 cloudinary
 httpx
-instagrapi
+instaloader
 pydantic
 pydantic-settings

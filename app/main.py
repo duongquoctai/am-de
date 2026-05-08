@@ -12,9 +12,8 @@ def read_root():
 @app.post("/api/jobs/crawl", response_model=JobCreateResponse, status_code=202)
 def create_crawl_job(request: JobCreateRequest, background_tasks: BackgroundTasks):
     try:
-        # Create initial pending job and get job_id
         job_id = supabase_service.create_job(
-            keyword=request.keyword, 
+            target=request.target, 
             platform=request.platform, 
             target_count=request.target_count
         )
@@ -23,8 +22,8 @@ def create_crawl_job(request: JobCreateRequest, background_tasks: BackgroundTask
         background_tasks.add_task(
             process_crawl_job,
             job_id=job_id,
-            keyword=request.keyword,
-            platform=request.platform,
+            target=request.target,
+            crawl_type=request.crawl_type,
             target_count=request.target_count
         )
         

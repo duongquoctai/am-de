@@ -11,7 +11,8 @@ class Settings(BaseSettings):
     
     ig_username: str = ""
     ig_password: str = ""
-    ig_session_file: str = "ig_session.json"
+    ig_session_file: str = "instaloader_session"
+    ig_session_base64: str = ""
 
     class Config:
         env_file = ".env"

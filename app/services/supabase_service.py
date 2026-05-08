@@ -7,12 +7,12 @@ class SupabaseService:
         if settings.supabase_url and settings.supabase_anon_key:
             self.supabase = create_client(settings.supabase_url, settings.supabase_anon_key)
 
-    def create_job(self, keyword: str, platform: str, target_count: int) -> str:
+    def create_job(self, target: str, platform: str, target_count: int) -> str:
         if not self.supabase:
             print("Warning: Supabase client not initialized")
             return "dummy-job-id"
         response = self.supabase.table("crawl_jobs").insert({
-            "keyword": keyword,
+            "keyword": target,
             "platform": platform,
             "target_count": target_count,
             "status": "pending"
