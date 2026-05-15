@@ -34,17 +34,59 @@ class TikTokScraper(BaseScraper):
 
     # -- helpers -------------------------------------------------------------
 
+    def _safe_json(self, resp: httpx.Response, endpoint: str) -> dict:
+        """Parse JSON from response with detailed error logging."""
+        try:
+            return resp.json()
+        except Exception as exc:
+            status = resp.status_code
+            ct = resp.headers.get("content-type", "")
+            preview = (resp.text or "")[:300]
+            logger.error(
+                f"[TikTok] {endpoint} returned non-JSON | "
+                f"status={status} content-type={ct} | body preview: {preview[:200]}"
+            )
+            raise RuntimeError(
+                f"[TikTok] {endpoint} did not return JSON "
+                f"(status={status}, content-type={ct}): {preview[:200]}"
+            ) from exc
+
+    def _is_waf_challenge(self, text: str) -> bool:
+        """Detect WAF/captcha challenge pages."""
+        signatures = (
+            "slardar", "challenge", "captcha", "verify",
+            "access denied", "blocked", "slardar-waf",
+            "cf-chl-bypass",
+        )
+        lower = (text or "")[:1000].lower()
+        return any(s in lower for s in signatures)
+
     def _extract_rehydration_json(self, html: str) -> dict:
         """Extract the SSR JSON blob from tiktok profile HTML."""
+        if self._is_waf_challenge(html):
+            raise RuntimeError(
+                "[TikTok] WAF/captcha challenge detected on profile page. "
+                "Your tiktok_cookie is invalid, expired, or from a restricted region. "
+                "Get a fresh cookie from browser DevTools → Network → copy Cookie header."
+            )
+
         m = re.search(
             r'<script\s+id="__UNIVERSAL_DATA_FOR_REHYDRATION__"\s+type="application/json">(.*?)</script>',
             html,
             re.DOTALL,
         )
         if not m:
-            raise RuntimeError("[TikTok] Cannot find __UNIVERSAL_DATA_FOR_REHYDRATION__ in HTML. "
-                               "Cookie may be missing or invalid.")
-        return json.loads(m.group(1))
+            raise RuntimeError(
+                "[TikTok] Cannot find __UNIVERSAL_DATA_FOR_REHYDRATION__ in profile HTML. "
+                "Cookie invalid or profile is private/non-existent."
+            )
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError as exc:
+            inner_preview = m.group(1)[:200]
+            raise RuntimeError(
+                f"[TikTok] SSR JSON blob is malformed: {inner_preview[:200]}"
+            ) from exc
 
     def _extract_sec_uid_from_scope(self, data: dict) -> str:
         """Navigate the __DEFAULT_SCOPE__ tree to find user.secUid."""
@@ -53,13 +95,17 @@ class TikTokScraper(BaseScraper):
         user_info = user_detail.get("userInfo", {})
         sec_uid = user_info.get("user", {}).get("secUid", "")
         if not sec_uid:
-            raise RuntimeError("[TikTok] secUid not found in SSR JSON.")
+            available_keys = list(scope.keys()) if scope else []
+            raise RuntimeError(
+                f"[TikTok] secUid not in SSR JSON. Available scope keys: {available_keys}"
+            )
         return sec_uid
 
     def _standardize_item(self, aweme: dict) -> Dict[str, Any] | None:
         """Convert a raw item from item_list / hashtag / search into our schema."""
         aweme_id = aweme.get("aweme_id") or aweme.get("id") or aweme.get("id_str")
         if not aweme_id:
+            logger.debug(f"[TikTok] Skipping item without aweme_id, keys: {list(aweme.keys())[:6]}")
             return None
 
         video_block = aweme.get("video") or {}
@@ -71,6 +117,9 @@ class TikTokScraper(BaseScraper):
                         video_block.get("download_addr", {}).get("url_list", [""])[0] or ""
 
         video_url = play_urls or download_urls or ""
+        if not video_url:
+            logger.warning(f"[TikTok] No video URL for aweme_id={aweme_id}")
+            return None
 
         author = aweme.get("author") or {}
         author_name = author.get("uniqueId") or author.get("unique_id") or author.get("nickname", "")
@@ -82,7 +131,7 @@ class TikTokScraper(BaseScraper):
         return {
             "video_url": video_url,
             "source_id": str(aweme_id),
-            "source_url": f"https://www.tiktok.com/@{author.get('uniqueId', author_name)}/video/{aweme_id}",
+            "source_url": f"https://www.tiktok.com/@{author.get('uniqueId', author_name) or author_name}/video/{aweme_id}",
             "author_username": author_name,
             "original_caption": aweme.get("desc", ""),
             "duration": int(duration_ms // 1000) if duration_ms else 0,
@@ -103,17 +152,19 @@ class TikTokScraper(BaseScraper):
             sec_uid = self._extract_sec_uid_from_scope(self._extract_rehydration_json(resp.text))
             logger.info(f"[TikTok] resolved sec_uid={sec_uid}")
 
-            # 2. Iterate item_list (avoids per-video detail call)
+            # 2. Build API headers — include ttwid if server set it
+            api_headers = dict(self._headers)
+
             cursor = 0
             fetched = 0
             while fetched < limit:
                 url = (
                     f"https://www.tiktok.com/api/post/item_list/"
-                    f"?secUid={sec_uid}&count={min(limit - fetched, 35)}&cursor={cursor}"
+                    f"?secUid={sec_uid}&count={min(limit - fetched, 30)}&cursor={cursor}"
                 )
-                item_resp = await http.get(url)
+                item_resp = await http.get(url, headers=api_headers)
                 item_resp.raise_for_status()
-                data = item_resp.json()
+                data = self._safe_json(item_resp, "item_list")
                 items = data.get("aweme_list") or []
                 for item in items:
                     std = self._standardize_item(item)
@@ -122,9 +173,10 @@ class TikTokScraper(BaseScraper):
                         fetched += 1
                         if fetched >= limit:
                             break
-                if not data.get("hasMore", False):
+                has_more = data.get("hasMore", data.get("has_more", False))
+                if not has_more:
                     break
-                cursor = data.get("cursor", cursor + 35)
+                cursor = data.get("cursor", cursor + 30)
 
         logger.info(f"[TikTok] profile @{username} total fetched={fetched}")
 
@@ -132,19 +184,22 @@ class TikTokScraper(BaseScraper):
         tag = hashtag.lstrip("#").strip()
         logger.info(f"[TikTok] Fetching hashtag #{tag} (limit={limit})")
 
+        # Use the hashtag feed endpoint
         async with httpx.AsyncClient(headers=self._headers, follow_redirects=True, timeout=20) as http:
             cursor = 0
             fetched = 0
             while fetched < limit:
                 url = (
-                    f"https://www.tiktok.com/api/recommend/item-list/"
-                    f"?aid=1988&app_language=en&app_name=tiktok_web&"
-                    f"web_id=0&count={min(limit - fetched, 30)}&cursor={cursor}"
+                    f"https://www.tiktok.com/api/tag/item_list/"
+                    f"?aid=1988&count={min(limit - fetched, 30)}"
+                    f"&offset={cursor}&web_id=0&ref=profile&search_id=&"
+                    f"secUid=&type=1&category_id=0&category_type=0"
+                    f"&tag_name={urllib.parse.quote(tag)}"
                 )
                 hashtag_resp = await http.get(url)
                 hashtag_resp.raise_for_status()
-                data = hashtag_resp.json()
-                items = data.get("itemList") or data.get("items") or data.get("aweme_list") or []
+                data = self._safe_json(hashtag_resp, f"hashtag #{tag}")
+                items = data.get("aweme_list") or data.get("itemList") or data.get("items") or []
                 for item in items:
                     std = self._standardize_item(item)
                     if std:
@@ -152,7 +207,8 @@ class TikTokScraper(BaseScraper):
                         fetched += 1
                         if fetched >= limit:
                             break
-                if not data.get("hasMore", False):
+                has_more = data.get("hasMore", data.get("has_more", False))
+                if not has_more:
                     break
                 cursor = data.get("cursor", cursor + 30)
 
@@ -167,13 +223,9 @@ class TikTokScraper(BaseScraper):
             while fetched < limit:
                 url = (
                     f"https://www.tiktok.com/api/search/item/full/"
-                    f"?aid=1988&keyword={urllib.parse.quote(keyword)}&search_id=&"
-                    f"search_source=history&enter_from=&search_duration=0&"
-                    f"search_group_id=&type=1&history_verification_token=&"
-                    f"need_filter_item=false&source=0&is_edit_query=false&"
-                    f"aid_string_on_web=1&count={min(limit - fetched, 30)}&cursor={cursor}"
+                    f"?aid=1988&keyword={urllib.parse.quote(keyword)}"
+                    f"&count={min(limit - fetched, 30)}&cursor={cursor}"
                 )
-                # Sign with X-Bogus (Douyin X-Bogus)
                 try:
                     signed = self._scraper.generate_x_bogus_url(url)
                     search_resp = await http.get(signed)
@@ -181,16 +233,18 @@ class TikTokScraper(BaseScraper):
                     search_resp = await http.get(url)
 
                 search_resp.raise_for_status()
-                data = search_resp.json()
+                data = self._safe_json(search_resp, f"search '{keyword}'")
                 items = data.get("itemList") or data.get("data") or []
                 for item in items:
-                    std = self._standardize_item(item)
+                    aweme = item.get("aweme_info") or item
+                    std = self._standardize_item(aweme)
                     if std:
                         yield std
                         fetched += 1
                         if fetched >= limit:
                             break
-                if not data.get("has_more", False):
+                has_more = data.get("has_more", data.get("hasMore", False))
+                if not has_more:
                     break
                 cursor = data.get("cursor", cursor + 30)
 
@@ -224,6 +278,23 @@ class DouyinScraper(BaseScraper):
         # Also set scraper-level headers
         self._scraper.douyin_api_headers.update(self._headers)
 
+    def _safe_json(self, resp: httpx.Response, endpoint: str) -> dict:
+        """Parse JSON from response with detailed error logging."""
+        try:
+            return resp.json()
+        except Exception as exc:
+            status = resp.status_code
+            ct = resp.headers.get("content-type", "")
+            preview = (resp.text or "")[:300]
+            logger.error(
+                f"[Douyin] {endpoint} returned non-JSON | "
+                f"status={status} content-type={ct} | body preview: {preview[:200]}"
+            )
+            raise RuntimeError(
+                f"[Douyin] {endpoint} did not return JSON "
+                f"(status={status}, content-type={ct}): {preview[:200]}"
+            ) from exc
+
     def _sign_url(self, url: str) -> str:
         try:
             return self._scraper.generate_x_bogus_url(url)
@@ -234,6 +305,7 @@ class DouyinScraper(BaseScraper):
     def _standardize_item(self, aweme: dict) -> Dict[str, Any] | None:
         aweme_id = aweme.get("aweme_id") or aweme.get("id") or aweme.get("id_str")
         if not aweme_id:
+            logger.debug(f"[Douyin] Skipping item without aweme_id, keys: {list(aweme.keys())[:6]}")
             return None
         video_block = aweme.get("video") or {}
         play_urls = video_block.get("playAddr", "") or video_block.get("play_addr", {}).get("url_list", [""])[0] or ""
@@ -254,7 +326,7 @@ class DouyinScraper(BaseScraper):
         logger.info(f"[Douyin] Fetching profile short_code={douyin_short_code} (limit={limit})")
 
         if len(douyin_short_code) <= 8:
-            url = f"https://www.douyin.com/ {douyin_short_code}"
+            url = f"https://www.douyin.com/{douyin_short_code}"
         else:
             url = f"https://www.douyin.com/user/{douyin_short_code}"
 
@@ -262,12 +334,19 @@ class DouyinScraper(BaseScraper):
             html_resp = await http.get(url)
             html_resp.raise_for_status()
 
-            sec_uid = re.search(r'"secUid":"([^"]+)"', html_resp.text)
-            if not sec_uid:
+            if any(s in html_resp.text.lower() for s in ("security check", "verify", "captcha", "challenge")):
+                raise RuntimeError(
+                    "[Douyin] WAF/captcha challenge detected. "
+                    "Your douyin_cookie is invalid or expired. "
+                    "Get a fresh cookie from douyin.com."
+                )
+
+            sec_uid_match = re.search(r'"secUid":"([^"]+)"', html_resp.text)
+            if not sec_uid_match:
                 preview = html_resp.text[:300]
                 raise RuntimeError(f"[Douyin] Could not extract sec_uid from profile HTML. "
                                    f"Cookie may be missing or invalid. HTML preview: {preview}")
-            sec_uid = sec_uid.group(1)
+            sec_uid = sec_uid_match.group(1)
 
             cursor = 0
             fetched = 0
@@ -281,7 +360,7 @@ class DouyinScraper(BaseScraper):
                 signed = self._sign_url(base)
                 item_resp = await http.get(signed)
                 item_resp.raise_for_status()
-                data = item_resp.json()
+                data = self._safe_json(item_resp, f"profile {douyin_short_code}")
                 items = data.get("aweme_list") or data.get("awemeData") or []
                 for item in items:
                     std = self._standardize_item(item)
@@ -315,7 +394,7 @@ class DouyinScraper(BaseScraper):
                 signed = self._sign_url(base)
                 search_resp = await http.get(signed)
                 search_resp.raise_for_status()
-                data = search_resp.json()
+                data = self._safe_json(search_resp, f"search '{keyword}'")
                 items = data.get("data", [])
                 if isinstance(items, list):
                     for item in items:
