@@ -12,11 +12,14 @@ def read_root():
 @app.post("/api/jobs/crawl", response_model=JobCreateResponse, status_code=202)
 def create_crawl_job(request: JobCreateRequest, background_tasks: BackgroundTasks):
     try:
-        job_id = supabase_service.create_job(
-            target=request.target, 
-            platform=request.platform, 
-            target_count=request.target_count
-        )
+        # Use provided job_id if available, otherwise create a new one
+        job_id = request.job_id
+        if not job_id:
+            job_id = supabase_service.create_job(
+                target=request.target, 
+                platform=request.platform, 
+                target_count=request.target_count
+            )
         
         # Queue the job parsing sequence using FastAPI BackgroundTasks
         background_tasks.add_task(
@@ -24,7 +27,8 @@ def create_crawl_job(request: JobCreateRequest, background_tasks: BackgroundTask
             job_id=job_id,
             target=request.target,
             crawl_type=request.crawl_type,
-            target_count=request.target_count
+            target_count=request.target_count,
+            platform=request.platform
         )
         
         return JobCreateResponse(

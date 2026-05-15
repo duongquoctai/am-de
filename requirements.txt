@@ -6,3 +6,4 @@ httpx
 instaloader
 pydantic
 pydantic-settings
+douyin-tiktok-scraper
