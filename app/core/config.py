@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     ig_password: str = ""
     ig_session_file: str = "instaloader_session"
     ig_session_base64: str = ""
+    
+    tiktok_cookie: str = ""
+    douyin_cookie: str = ""
 
     class Config:
         env_file = ".env"

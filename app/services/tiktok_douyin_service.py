@@ -31,24 +31,51 @@ class TikTokScraper(BaseScraper):
         cookie = getattr(settings, "tiktok_cookie", None)
         if cookie:
             self._headers["Cookie"] = cookie
+        
+        # Ensure the internal scraper uses our User-Agent for X-Bogus signing
+        self._scraper.headers["User-Agent"] = self._headers["User-Agent"]
 
     # -- helpers -------------------------------------------------------------
 
+    async def _pre_auth(self, http: httpx.AsyncClient) -> None:
+        """
+        Visit tiktok.com to obtain ttwid/msToken cookies.
+        The server sets ttwid via Set-Cookie; httpx stores it automatically.
+        This is required — every TikTok API endpoint checks for a valid ttwid.
+        """
+        logger.info("[TikTok] _pre_auth: hitting homepage to get ttwid...")
+        resp = await http.get("https://www.tiktok.com/")
+        resp.raise_for_status()
+        set_cookies = http.cookies.jar
+        ttwid_found = any(c.name == "ttwid" for c in set_cookies)
+        if not ttwid_found:
+            logger.warning(
+                "[TikTok] _pre_auth: ttwid NOT in Set-Cookie. "
+                "All cookies present: %s",
+                [c.name for c in set_cookies],
+            )
+        else:
+            logger.info("[TikTok] _pre_auth: ttwid obtained successfully")
+
     def _safe_json(self, resp: httpx.Response, endpoint: str) -> dict:
-        """Parse JSON from response with detailed error logging."""
+        """Parse JSON with detailed error info; handle empty body gracefully."""
+        raw = resp.text or ""
+        if not raw.strip():
+            raise RuntimeError(
+                f"[TikTok] {endpoint} returned empty body "
+                f"(status={resp.status_code}, content-type={resp.headers.get('content-type', '')})"
+            )
         try:
             return resp.json()
         except Exception as exc:
-            status = resp.status_code
             ct = resp.headers.get("content-type", "")
-            preview = (resp.text or "")[:300]
             logger.error(
-                f"[TikTok] {endpoint} returned non-JSON | "
-                f"status={status} content-type={ct} | body preview: {preview[:200]}"
+                "[TikTok] %s returned non-JSON | status=%s content-type=%s body=%s",
+                endpoint, resp.status_code, ct, raw[:200],
             )
             raise RuntimeError(
-                f"[TikTok] {endpoint} did not return JSON "
-                f"(status={status}, content-type={ct}): {preview[:200]}"
+                f"[TikTok] {endpoint} response is not parseable JSON "
+                f"(status={resp.status_code}): {raw[:200]}"
             ) from exc
 
     def _is_waf_challenge(self, text: str) -> bool:
@@ -137,24 +164,27 @@ class TikTokScraper(BaseScraper):
             "duration": int(duration_ms // 1000) if duration_ms else 0,
         }
 
-    # -- fetchers ------------------------------------------------------------
+    # -- fetchers  (all call _pre_auth so ttwid cookie is set)
 
     async def _fetch_from_profile(self, username: str, limit: int, platform: str = "tiktok") -> AsyncGenerator[Dict[str, Any], None]:
         username = username.replace("@", "").strip()
         logger.info(f"[TikTok] Fetching profile @{username} (limit={limit})")
 
-        async with httpx.AsyncClient(headers=self._headers, follow_redirects=True, timeout=20) as http:
+        async with httpx.AsyncClient(headers=self._headers, follow_redirects=True, cookies=httpx.Cookies(), timeout=20) as http:
+            # 0. Pre-auth — visit homepage so server sets ttwid
+            await self._pre_auth(http)
+
             # 1. Resolve sec_uid from SSR
             profile_url = f"https://www.tiktok.com/@{username}"
-            resp = await http.get(profile_url)
-            resp.raise_for_status()
+            profile_resp = await http.get(profile_url)
+            profile_resp.raise_for_status()
+            if self._is_waf_challenge(profile_resp.text):
+                raise RuntimeError("[TikTok] WAF challenge on profile page — cookie invalid")
 
-            sec_uid = self._extract_sec_uid_from_scope(self._extract_rehydration_json(resp.text))
+            sec_uid = self._extract_sec_uid_from_scope(self._extract_rehydration_json(profile_resp.text))
             logger.info(f"[TikTok] resolved sec_uid={sec_uid}")
 
-            # 2. Build API headers — include ttwid if server set it
-            api_headers = dict(self._headers)
-
+            # 2. Iterate item_list (http cookies jar already has ttwid)
             cursor = 0
             fetched = 0
             while fetched < limit:
@@ -162,10 +192,15 @@ class TikTokScraper(BaseScraper):
                     f"https://www.tiktok.com/api/post/item_list/"
                     f"?secUid={sec_uid}&count={min(limit - fetched, 30)}&cursor={cursor}"
                 )
-                item_resp = await http.get(url, headers=api_headers)
+                try:
+                    signed = self._scraper.generate_x_bogus_url(url)
+                    item_resp = await http.get(signed)
+                except Exception:
+                    item_resp = await http.get(url)
+                
                 item_resp.raise_for_status()
                 data = self._safe_json(item_resp, "item_list")
-                items = data.get("aweme_list") or []
+                items = data.get("item_list") or data.get("itemList") or data.get("aweme_list") or []
                 for item in items:
                     std = self._standardize_item(item)
                     if std:
@@ -182,42 +217,22 @@ class TikTokScraper(BaseScraper):
 
     async def _fetch_from_hashtag(self, hashtag: str, limit: int, platform: str = "tiktok") -> AsyncGenerator[Dict[str, Any], None]:
         tag = hashtag.lstrip("#").strip()
-        logger.info(f"[TikTok] Fetching hashtag #{tag} (limit={limit})")
-
-        # Use the hashtag feed endpoint
-        async with httpx.AsyncClient(headers=self._headers, follow_redirects=True, timeout=20) as http:
-            cursor = 0
-            fetched = 0
-            while fetched < limit:
-                url = (
-                    f"https://www.tiktok.com/api/tag/item_list/"
-                    f"?aid=1988&count={min(limit - fetched, 30)}"
-                    f"&offset={cursor}&web_id=0&ref=profile&search_id=&"
-                    f"secUid=&type=1&category_id=0&category_type=0"
-                    f"&tag_name={urllib.parse.quote(tag)}"
-                )
-                hashtag_resp = await http.get(url)
-                hashtag_resp.raise_for_status()
-                data = self._safe_json(hashtag_resp, f"hashtag #{tag}")
-                items = data.get("aweme_list") or data.get("itemList") or data.get("items") or []
-                for item in items:
-                    std = self._standardize_item(item)
-                    if std:
-                        yield std
-                        fetched += 1
-                        if fetched >= limit:
-                            break
-                has_more = data.get("hasMore", data.get("has_more", False))
-                if not has_more:
-                    break
-                cursor = data.get("cursor", cursor + 30)
-
-        logger.info(f"[TikTok] hashtag #{tag} total fetched={fetched}")
+        logger.info(f"[TikTok] Fetching hashtag #{tag} (limit={limit}) by redirecting to keyword search.")
+        
+        # TikTok's /api/tag/item_list is currently blocking or returning 'url doesn't match'
+        # The search API is more reliable.
+        async for item in self._fetch_from_keyword(f"#{tag}", limit, platform):
+            yield item
 
     async def _fetch_from_keyword(self, keyword: str, limit: int, platform: str = "tiktok") -> AsyncGenerator[Dict[str, Any], None]:
         logger.info(f"[TikTok] Search keyword '{keyword}' (limit={limit})")
 
         async with httpx.AsyncClient(headers=self._headers, follow_redirects=True, timeout=20) as http:
+            await self._pre_auth(http)
+            
+            cookie_str = self._headers.get("Cookie", "")
+            logger.info(f"[TikTok] Using cookie: {'YES (len=' + str(len(cookie_str)) + ')' if cookie_str else 'NO'}")
+            
             cursor = 0
             fetched = 0
             while fetched < limit:
@@ -228,13 +243,15 @@ class TikTokScraper(BaseScraper):
                 )
                 try:
                     signed = self._scraper.generate_x_bogus_url(url)
+                    logger.info(f"[TikTok] Signed search URL: {signed}")
                     search_resp = await http.get(signed)
-                except Exception:
+                except Exception as e:
+                    logger.error(f"[TikTok] X-Bogus signing failed: {e}")
                     search_resp = await http.get(url)
 
                 search_resp.raise_for_status()
                 data = self._safe_json(search_resp, f"search '{keyword}'")
-                items = data.get("itemList") or data.get("data") or []
+                items = data.get("item_list") or data.get("itemList") or data.get("data") or []
                 for item in items:
                     aweme = item.get("aweme_info") or item
                     std = self._standardize_item(aweme)
@@ -322,13 +339,20 @@ class DouyinScraper(BaseScraper):
             "duration": int(((aweme.get("duration", 0)) or (video_block.get("duration", 0) or 0)) / 1000),
         }
 
-    async def _fetch_from_profile(self, douyin_short_code: str, limit: int, platform: str = "douyin") -> AsyncGenerator[Dict[str, Any], None]:
-        logger.info(f"[Douyin] Fetching profile short_code={douyin_short_code} (limit={limit})")
+    async def _fetch_from_profile(self, douyin_target: str, limit: int, platform: str = "douyin") -> AsyncGenerator[Dict[str, Any], None]:
+        logger.info(f"[Douyin] Fetching profile target={douyin_target} (limit={limit})")
 
-        if len(douyin_short_code) <= 8:
-            url = f"https://www.douyin.com/{douyin_short_code}"
+        # Clean up the target
+        douyin_target = douyin_target.strip().split("?")[0]
+        
+        if douyin_target.startswith("http"):
+            url = douyin_target
+        elif douyin_target.startswith("MS4wLj"):
+            url = f"https://www.douyin.com/user/{douyin_target}"
+        elif len(douyin_target) <= 8:
+            url = f"https://v.douyin.com/{douyin_target}/"
         else:
-            url = f"https://www.douyin.com/user/{douyin_short_code}"
+            url = f"https://www.douyin.com/user/{douyin_target}"
 
         async with httpx.AsyncClient(headers=self._headers, follow_redirects=True, timeout=20) as http:
             html_resp = await http.get(url)
@@ -374,6 +398,12 @@ class DouyinScraper(BaseScraper):
                 cursor = data.get("max_cursor", cursor + 35)
 
         logger.info(f"[Douyin] profile short_code={douyin_short_code} total fetched={fetched}")
+
+    async def _fetch_from_hashtag(self, hashtag: str, limit: int, platform: str = "douyin") -> AsyncGenerator[Dict[str, Any], None]:
+        tag = hashtag.lstrip("#").strip()
+        logger.info(f"[Douyin] Fetching hashtag #{tag} (limit={limit}) by redirecting to keyword search.")
+        async for item in self._fetch_from_keyword(f"#{tag}", limit, platform):
+            yield item
 
     async def _fetch_from_keyword(self, keyword: str, limit: int, platform: str = "douyin") -> AsyncGenerator[Dict[str, Any], None]:
         logger.info(f"[Douyin] Search keyword '{keyword}' (limit={limit})")
