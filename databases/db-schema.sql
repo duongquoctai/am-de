@@ -6,6 +6,7 @@
 -- 1. TẠO CÁC ENUM TYPES 
 CREATE TYPE job_status AS ENUM ('pending', 'processing', 'completed', 'failed');
 CREATE TYPE post_status AS ENUM ('idle', 'posting', 'posted', 'failed');
+CREATE TYPE edit_status AS ENUM ('idle', 'editing', 'edited', 'failed');
 CREATE TYPE platform_type AS ENUM ('instagram', 'facebook', 'tiktok', 'douyin', 'xiaohongshu');
 
 -- ==========================================
@@ -48,7 +49,8 @@ CREATE TABLE public.videos (
     
     post_status post_status DEFAULT 'idle' NOT NULL,
     affiliate_link TEXT,             
-    posted_url TEXT,                 
+    posted_url TEXT,
+    edit_status edit_status DEFAULT 'idle' NOT NULL,               
     
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW(),
@@ -60,6 +62,7 @@ CREATE TABLE public.videos (
 CREATE INDEX idx_crawl_jobs_status ON public.crawl_jobs(status);
 CREATE INDEX idx_videos_job_id ON public.videos(job_id);
 CREATE INDEX idx_videos_post_status ON public.videos(post_status);
+CREATE INDEX idx_videos_edit_status ON public.videos(edit_status);
 
 -- ==========================================
 -- 4. TẠO TRIGGER TỰ ĐỘNG UPDATE THỜI GIAN
@@ -93,6 +96,10 @@ END $$;
 
 ALTER PUBLICATION supabase_realtime ADD TABLE public.crawl_jobs;
 ALTER PUBLICATION supabase_realtime ADD TABLE public.videos;
+
+-- Enable full replica identity to ensure all fields are sent in UPDATE events
+ALTER TABLE public.crawl_jobs REPLICA IDENTITY FULL;
+ALTER TABLE public.videos REPLICA IDENTITY FULL;
 
 -- ==========================================
 -- 6. ROW LEVEL SECURITY (RLS) POLICIES
